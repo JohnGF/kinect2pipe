@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.16)
 project(kinect2pipe)
 
 set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+set(CMAKE_BUILD_RPATH "/run/media/john/ssd external storage/git/libfreenect2/build/lib")
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(libswscale REQUIRED IMPORTED_TARGET libswscale)
