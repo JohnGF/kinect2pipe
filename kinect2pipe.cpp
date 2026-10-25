@@ -4,6 +4,8 @@
 #include <libfreenect2/frame_listener_impl.h>
 #include <linux/videodev2.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -11,6 +13,8 @@
 #include <cmath>
 #include <algorithm>
 #include <dirent.h>
+#include <cstring>
+#include <ctime>
 #include "kinect2pipe.h"
 
 extern "C" {
@@ -61,6 +65,10 @@ Kinect2Pipe::Kinect2Pipe() {
 
     this->dev = nullptr;
     this->v4l2Device = 0;
+    this->v4l2Device2 = 0;
+    this->shmFd = -1;
+    this->shmPtr = nullptr;
+    this->shmTotalSize = 0;
     this->openCount = 0;
     this->started = false;
     this->shuttingDown = false;
@@ -86,6 +94,13 @@ Kinect2Pipe::~Kinect2Pipe() {
         close(this->v4l2Device);
         this->v4l2Device = 0;
     }
+
+    if (this->v4l2Device2 > 0) {
+        close(this->v4l2Device2);
+        this->v4l2Device2 = 0;
+    }
+
+    this->closeShm();
 
     if (this->sws_rgb) {
         sws_freeContext(this->sws_rgb);
@@ -219,19 +234,28 @@ void Kinect2Pipe::keyboardListener() {
     }
 }
 
-void Kinect2Pipe::openLoopback(const char *loopbackDev) {
-    if (!this->openV4L2LoopbackDevice(loopbackDev, OUTPUT_WIDTH, OUTPUT_HEIGHT)) {
+void Kinect2Pipe::openLoopback(const char *loopbackDev, const char *loopbackDev2) {
+    if (!this->openV4L2LoopbackDevice(loopbackDev, OUTPUT_WIDTH, OUTPUT_HEIGHT, this->v4l2Device)) {
         exit(1);
     }
+    if (loopbackDev2 && strlen(loopbackDev2) > 0) {
+        if (!this->openV4L2LoopbackDevice(loopbackDev2, OUTPUT_WIDTH, OUTPUT_HEIGHT, this->v4l2Device2)) {
+            cerr << "Warning: failed to open secondary v4l2 device: " << loopbackDev2 << endl;
+            this->v4l2Device2 = -1;
+        } else {
+            cout << "Secondary loopback active on " << loopbackDev2 << endl;
+        }
+    }
+    this->initShm();
     this->writeBlankFrame();
 
     this->keyboardThread = thread(&Kinect2Pipe::keyboardListener, this);
 }
 
-bool Kinect2Pipe::openV4L2LoopbackDevice(const char* loopbackDev, int width, int height) {
-    this->v4l2Device = open(loopbackDev, O_WRONLY | O_NONBLOCK);
-    if (this->v4l2Device < 0) {
-        cerr << "failed to open v4l2loopback device: " << errno << endl;
+bool Kinect2Pipe::openV4L2LoopbackDevice(const char* loopbackDev, int width, int height, int& outFd) {
+    outFd = open(loopbackDev, O_WRONLY | O_NONBLOCK);
+    if (outFd < 0) {
+        cerr << "failed to open v4l2loopback device: " << loopbackDev << " (errno " << errno << ")" << endl;
         return false;
     }
     struct v4l2_format fmt{};
@@ -244,8 +268,10 @@ bool Kinect2Pipe::openV4L2LoopbackDevice(const char* loopbackDev, int width, int
     fmt.fmt.pix.bytesperline = fmt.fmt.pix.width;
     fmt.fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
 
-    if (ioctl(this->v4l2Device, VIDIOC_S_FMT, &fmt) < 0) {
-        cerr << "failed to issue ioctl to v4l2loopback device: " << errno << endl;
+    if (ioctl(outFd, VIDIOC_S_FMT, &fmt) < 0) {
+        cerr << "failed to issue ioctl to v4l2loopback device: " << loopbackDev << " (errno " << errno << ")" << endl;
+        close(outFd);
+        outFd = -1;
         return false;
     }
 
@@ -354,12 +380,7 @@ bool Kinect2Pipe::handleRgbFrame(Frame* frame, bool boost) {
     }
 
     sws_scale(this->sws_rgb, this->srcPtr, this->srcStride, 0, KINECT2_IMAGE_HEIGHT, this->dstPtr, this->dstStride);
-    ssize_t ret = write(this->v4l2Device, this->imageBuffer, YUV_BUFFER_LEN);
-    if (ret <= 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == EPIPE) {
-            return true;
-        }
-    }
+    this->writeToOutputs(this->imageBuffer, YUV_BUFFER_LEN);
     return true;
 }
 
@@ -380,12 +401,7 @@ bool Kinect2Pipe::handleIrFrame(Frame* frame) {
 
     this->srcIrPtr[0] = this->irGrayBuffer;
     sws_scale(this->sws_ir, this->srcIrPtr, this->srcIrStride, 0, KINECT2_IR_HEIGHT, this->dstPtr, this->dstStride);
-    ssize_t ret = write(this->v4l2Device, this->imageBuffer, YUV_BUFFER_LEN);
-    if (ret <= 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == EPIPE) {
-            return true;
-        }
-    }
+    this->writeToOutputs(this->imageBuffer, YUV_BUFFER_LEN);
     return true;
 }
 
@@ -473,6 +489,87 @@ void Kinect2Pipe::run() {
 void Kinect2Pipe::writeBlankFrame() {
     memset(this->imageBuffer, 0x10, YUV_BUFFER_Y_LEN);
     memset(this->imageBuffer + YUV_BUFFER_Y_LEN, 0x80, YUV_BUFFER_UV_LEN * 2);
-    ssize_t ret = write(this->v4l2Device, this->imageBuffer, YUV_BUFFER_LEN);
-    (void)ret;
+    this->writeToOutputs(this->imageBuffer, YUV_BUFFER_LEN);
+}
+
+void Kinect2Pipe::writeToOutputs(const uint8_t* buffer, size_t size) {
+    if (this->v4l2Device > 0) {
+        ssize_t ret = write(this->v4l2Device, buffer, size);
+        (void)ret;
+    }
+    if (this->v4l2Device2 > 0) {
+        ssize_t ret = write(this->v4l2Device2, buffer, size);
+        (void)ret;
+    }
+    this->updateShm(buffer, size);
+}
+
+bool Kinect2Pipe::initShm() {
+    this->shmTotalSize = sizeof(KinectSharedMemoryHeader) + YUV_BUFFER_LEN;
+    this->shmFd = open(KINECT_SHM_NAME, O_RDWR | O_CREAT, 0666);
+    if (this->shmFd < 0) {
+        cerr << "Warning: failed to open shm file: " << KINECT_SHM_NAME << " (" << strerror(errno) << ")" << endl;
+        this->shmPtr = nullptr;
+        return false;
+    }
+
+    if (ftruncate(this->shmFd, this->shmTotalSize) != 0) {
+        cerr << "Warning: ftruncate shm failed: " << strerror(errno) << endl;
+        close(this->shmFd);
+        this->shmFd = -1;
+        this->shmPtr = nullptr;
+        return false;
+    }
+
+    this->shmPtr = static_cast<uint8_t*>(mmap(nullptr, this->shmTotalSize, PROT_READ | PROT_WRITE, MAP_SHARED, this->shmFd, 0));
+    if (this->shmPtr == MAP_FAILED) {
+        cerr << "Warning: mmap shm failed: " << strerror(errno) << endl;
+        close(this->shmFd);
+        this->shmFd = -1;
+        this->shmPtr = nullptr;
+        return false;
+    }
+
+    auto* hdr = reinterpret_cast<KinectSharedMemoryHeader*>(this->shmPtr);
+    memset(hdr, 0, sizeof(KinectSharedMemoryHeader));
+    hdr->magic = KINECT_SHM_MAGIC;
+    hdr->version = 1;
+    hdr->width = OUTPUT_WIDTH;
+    hdr->height = OUTPUT_HEIGHT;
+    hdr->yuv_bytes = YUV_BUFFER_LEN;
+    hdr->mode = static_cast<uint32_t>(this->currentMode.load());
+    hdr->sequence = 0;
+
+    cout << "Lock-free shared memory active at " << KINECT_SHM_NAME << " (" << this->shmTotalSize << " bytes)" << endl;
+    return true;
+}
+
+void Kinect2Pipe::updateShm(const uint8_t* buffer, size_t size) {
+    if (!this->shmPtr || size != YUV_BUFFER_LEN) return;
+
+    auto* hdr = reinterpret_cast<KinectSharedMemoryHeader*>(this->shmPtr);
+    // Seqlock begin write (odd sequence)
+    __atomic_add_fetch(&hdr->sequence, 1, __ATOMIC_RELEASE);
+
+    hdr->mode = static_cast<uint32_t>(this->currentMode.load());
+    struct timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    hdr->timestamp_ns = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
+
+    memcpy(this->shmPtr + sizeof(KinectSharedMemoryHeader), buffer, size);
+
+    // Seqlock end write (even sequence)
+    __atomic_add_fetch(&hdr->sequence, 1, __ATOMIC_RELEASE);
+}
+
+void Kinect2Pipe::closeShm() {
+    if (this->shmPtr && this->shmPtr != MAP_FAILED) {
+        munmap(this->shmPtr, this->shmTotalSize);
+        this->shmPtr = nullptr;
+    }
+    if (this->shmFd >= 0) {
+        close(this->shmFd);
+        this->shmFd = -1;
+    }
+    unlink(KINECT_SHM_NAME);
 }

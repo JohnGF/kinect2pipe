@@ -115,4 +115,8 @@ fi
 echo "Press Ctrl+C or 'q' to stop."
 
 # Pin process to the last hardware core (CPU 14,15) for zero contention with games
-exec taskset -c 14,15 "${KINECT2PIPE}" "${DEVICE}"
+if [[ "${ENABLE_OBS}" == "true" && -e "${OBS_DEVICE}" ]]; then
+  exec taskset -c 14,15 "${KINECT2PIPE}" "${DEVICE}" "${OBS_DEVICE}"
+else
+  exec taskset -c 14,15 "${KINECT2PIPE}" "${DEVICE}"
+fi

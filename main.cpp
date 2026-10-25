@@ -35,8 +35,8 @@ void signalHandler(int signum) {
  * @return Exit status
  */
 int main(int argc, char** argv) {
-    if (argc != 2) {
-        printf("usage: kinect2pipe [path to v4l2loopback device]\n");
+    if (argc < 2 || argc > 3) {
+        printf("usage: kinect2pipe <primary v4l2 device> [secondary v4l2 device]\n");
         exit(-1);
     }
 
@@ -50,7 +50,8 @@ int main(int argc, char** argv) {
     sigaction(SIGUSR2, &sa, nullptr);
 
     g_pipe = new Kinect2Pipe();
-    g_pipe->openLoopback(argv[1]);
+    const char* dev2 = (argc == 3) ? argv[2] : nullptr;
+    g_pipe->openLoopback(argv[1], dev2);
     g_pipe->run();
 
     delete g_pipe;
