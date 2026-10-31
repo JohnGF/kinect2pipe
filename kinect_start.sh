@@ -6,7 +6,7 @@ BUILD_DIR="${SCRIPT_DIR}/build"
 KINECT2PIPE="${BUILD_DIR}/kinect2pipe"
 DEVICE="/dev/video10"
 OBS_DEVICE="/dev/video11"
-for libpath in "${SCRIPT_DIR}/lib" "${SCRIPT_DIR}/../libfreenect2/build/lib" "/home/john/git/libfreenect2/build/lib" "/run/media/john/ssd_external/git/libfreenect2/build/lib"; do
+for libpath in "${SCRIPT_DIR}/lib" "${SCRIPT_DIR}/../libfreenect2/build/lib"; do
   if [[ -d "${libpath}" ]]; then
     export LD_LIBRARY_PATH="${libpath}:${LD_LIBRARY_PATH:-}"
     break
@@ -14,8 +14,12 @@ for libpath in "${SCRIPT_DIR}/lib" "${SCRIPT_DIR}/../libfreenect2/build/lib" "/h
 done
 
 ENABLE_OBS=false
+IR_ARGS=()
 for arg in "$@"; do
   case "${arg}" in
+    --ir|-i)
+      IR_ARGS=(--ir)
+      ;;
     --obs|-o)
       ENABLE_OBS=true
       ;;
@@ -24,6 +28,10 @@ for arg in "$@"; do
       echo ""
       echo "Options:"
       echo "  --obs, -o     Initialize secondary loopback device (/dev/video11) for OBS Virtual Camera"
+      echo "  --ir, -i      Also stream raw IR + depth to /dev/shm/kinect2pipe_ir_shm alongside color"
+      echo ""
+      echo "Environment:"
+      echo "  KINECT2PIPE_CPUS=14,15   pin kinect2pipe to these CPUs (taskset)"
       echo "  -h, --help    Show this help message"
       exit 0
       ;;
@@ -114,9 +122,13 @@ else
 fi
 echo "Press Ctrl+C or 'q' to stop."
 
-# Pin process to the last hardware core (CPU 14,15) for zero contention with games
+# Optional CPU pinning, e.g. KINECT2PIPE_CPUS=14,15 to keep JPEG decoding off the cores games use
+PIN=()
+if [[ -n "${KINECT2PIPE_CPUS:-}" ]]; then
+  PIN=(taskset -c "${KINECT2PIPE_CPUS}")
+fi
 if [[ "${ENABLE_OBS}" == "true" && -e "${OBS_DEVICE}" ]]; then
-  exec taskset -c 14,15 "${KINECT2PIPE}" "${DEVICE}" "${OBS_DEVICE}"
+  exec "${PIN[@]}" "${KINECT2PIPE}" "${IR_ARGS[@]}" "${DEVICE}" "${OBS_DEVICE}"
 else
-  exec taskset -c 14,15 "${KINECT2PIPE}" "${DEVICE}"
+  exec "${PIN[@]}" "${KINECT2PIPE}" "${IR_ARGS[@]}" "${DEVICE}"
 fi

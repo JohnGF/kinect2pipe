@@ -4,7 +4,7 @@ project(kinect2pipe)
 set(CMAKE_CXX_STANDARD 14)
 add_compile_options(-O3 -march=native -mtune=native)
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
-set(CMAKE_BUILD_RPATH "\$ORIGIN/../lib;\$ORIGIN/../../libfreenect2/build/lib;\$ORIGIN;/home/john/git/libfreenect2/build/lib")
+set(CMAKE_BUILD_RPATH "\$ORIGIN/../lib;\$ORIGIN/../../libfreenect2/build/lib;\$ORIGIN")
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(libswscale REQUIRED IMPORTED_TARGET libswscale)
