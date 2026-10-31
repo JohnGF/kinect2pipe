@@ -24,7 +24,7 @@ extern "C" {
 using namespace std;
 using namespace libfreenect2;
 
-Kinect2Pipe::Kinect2Pipe() {
+Kinect2Pipe::Kinect2Pipe(bool irShmEnabled) {
     this->sws_rgb = sws_getContext(
         KINECT2_IMAGE_WIDTH, KINECT2_IMAGE_HEIGHT, AV_PIX_FMT_RGB32,
         OUTPUT_WIDTH, OUTPUT_HEIGHT, AV_PIX_FMT_YUV420P,
@@ -74,6 +74,12 @@ Kinect2Pipe::Kinect2Pipe() {
     this->shuttingDown = false;
     this->currentMode = MODE_RGB_NORMAL;
     this->termiosSaved = false;
+    this->irShmEnabled = irShmEnabled;
+    this->irShmFd = -1;
+    this->irShmPtr = nullptr;
+    this->irShmTotalSize = 0;
+    this->pendingDeviceTs = 0;
+    this->pendingDeviceSeq = 0;
 
     libfreenect2::setGlobalLogger(nullptr);
 }
@@ -101,6 +107,7 @@ Kinect2Pipe::~Kinect2Pipe() {
     }
 
     this->closeShm();
+    this->closeIrShm();
 
     if (this->sws_rgb) {
         sws_freeContext(this->sws_rgb);
@@ -247,6 +254,9 @@ void Kinect2Pipe::openLoopback(const char *loopbackDev, const char *loopbackDev2
         }
     }
     this->initShm();
+    if (this->irShmEnabled) {
+        this->initIrShm();
+    }
     this->writeBlankFrame();
 
     this->keyboardThread = thread(&Kinect2Pipe::keyboardListener, this);
@@ -280,7 +290,8 @@ bool Kinect2Pipe::openV4L2LoopbackDevice(const char* loopbackDev, int width, int
 
 bool Kinect2Pipe::openKinect2Device() {
     SyncMultiFrameListener colorListener(Frame::Color);
-    SyncMultiFrameListener irListener(Frame::Ir);
+    SyncMultiFrameListener irListener(Frame::Ir | Frame::Depth);
+    FrameMap irFrames;
 
     if (freenect2.enumerateDevices() == 0) {
         cerr << "unable to find a kinect2 device to connect to" << endl;
@@ -295,9 +306,13 @@ bool Kinect2Pipe::openKinect2Device() {
     this->dev->setColorFrameListener(&colorListener);
     this->dev->setIrAndDepthFrameListener(&irListener);
 
+    // With --ir the IR/depth pipeline always runs so the IR shm segment is fed in parallel with color.
+    auto wantRgb = [](VideoMode m) { return m != MODE_IR_NIGHT_VISION; };
+    auto wantIr = [this](VideoMode m) { return m == MODE_IR_NIGHT_VISION || (this->irShmEnabled && this->irShmPtr); };
+
     VideoMode activeMode = this->currentMode.load();
-    bool activeRgb = (activeMode != MODE_IR_NIGHT_VISION);
-    bool activeIr = (activeMode == MODE_IR_NIGHT_VISION);
+    bool activeRgb = wantRgb(activeMode);
+    bool activeIr = wantIr(activeMode);
 
     if (!this->dev->startStreams(activeRgb, activeIr)) {
         cerr << "unable to start kinect2 streams" << endl;
@@ -308,8 +323,8 @@ bool Kinect2Pipe::openKinect2Device() {
 
     while (this->started && !this->shuttingDown) {
         VideoMode mode = this->currentMode.load();
-        bool needRgb = (mode != MODE_IR_NIGHT_VISION);
-        bool needIr = (mode == MODE_IR_NIGHT_VISION);
+        bool needRgb = wantRgb(mode);
+        bool needIr = wantIr(mode);
 
         if (needRgb != activeRgb || needIr != activeIr) {
             cout << "\nSwitching active hardware streams..." << endl;
@@ -320,27 +335,38 @@ bool Kinect2Pipe::openKinect2Device() {
             }
             activeRgb = needRgb;
             activeIr = needIr;
-            activeMode = mode;
         }
+        activeMode = mode;
 
         if (activeMode == MODE_IR_NIGHT_VISION) {
-            if (!irListener.waitForNewFrame(frames, 100)) {
+            if (!irListener.waitForNewFrame(irFrames, 100)) {
                 continue;
             }
-            Frame* irFrame = frames[Frame::Ir];
+            Frame* irFrame = irFrames[Frame::Ir];
             if (irFrame) {
+                this->pendingDeviceTs = irFrame->timestamp;
+                this->pendingDeviceSeq = irFrame->sequence;
                 this->handleIrFrame(irFrame);
+                this->publishIrDepth(irFrame, irFrames[Frame::Depth]);
             }
-            irListener.release(frames);
+            irListener.release(irFrames);
         } else {
             if (!colorListener.waitForNewFrame(frames, 100)) {
                 continue;
             }
             Frame* colorFrame = frames[Frame::Color];
             if (colorFrame) {
+                this->pendingDeviceTs = colorFrame->timestamp;
+                this->pendingDeviceSeq = colorFrame->sequence;
                 this->handleRgbFrame(colorFrame, mode == MODE_RGB_BOOST);
             }
             colorListener.release(frames);
+
+            // Drain the parallel IR/depth stream without blocking the color path.
+            if (activeIr && irListener.hasNewFrame() && irListener.waitForNewFrame(irFrames, 0)) {
+                this->publishIrDepth(irFrames[Frame::Ir], irFrames[Frame::Depth]);
+                irListener.release(irFrames);
+            }
         }
     }
 
@@ -555,6 +581,10 @@ void Kinect2Pipe::updateShm(const uint8_t* buffer, size_t size) {
     struct timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     hdr->timestamp_ns = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
+    hdr->device_ts = this->pendingDeviceTs;
+    hdr->device_seq = this->pendingDeviceSeq;
+    this->pendingDeviceTs = 0;
+    this->pendingDeviceSeq = 0;
 
     memcpy(this->shmPtr + sizeof(KinectSharedMemoryHeader), buffer, size);
 
@@ -572,4 +602,86 @@ void Kinect2Pipe::closeShm() {
         this->shmFd = -1;
     }
     unlink(KINECT_SHM_NAME);
+}
+
+bool Kinect2Pipe::initIrShm() {
+    this->irShmTotalSize = sizeof(KinectIrSharedMemoryHeader) + KINECT_IR_PAYLOAD_BYTES;
+    this->irShmFd = open(KINECT_IR_SHM_NAME, O_RDWR | O_CREAT, 0666);
+    if (this->irShmFd < 0) {
+        cerr << "Warning: failed to open IR shm file: " << KINECT_IR_SHM_NAME << " (" << strerror(errno) << ")" << endl;
+        return false;
+    }
+    if (ftruncate(this->irShmFd, this->irShmTotalSize) != 0) {
+        cerr << "Warning: ftruncate IR shm failed: " << strerror(errno) << endl;
+        close(this->irShmFd);
+        this->irShmFd = -1;
+        return false;
+    }
+    void* p = mmap(nullptr, this->irShmTotalSize, PROT_READ | PROT_WRITE, MAP_SHARED, this->irShmFd, 0);
+    if (p == MAP_FAILED) {
+        cerr << "Warning: mmap IR shm failed: " << strerror(errno) << endl;
+        close(this->irShmFd);
+        this->irShmFd = -1;
+        return false;
+    }
+    this->irShmPtr = static_cast<uint8_t*>(p);
+
+    auto* hdr = reinterpret_cast<KinectIrSharedMemoryHeader*>(this->irShmPtr);
+    memset(this->irShmPtr, 0, this->irShmTotalSize);
+    hdr->magic = KINECT_IR_SHM_MAGIC;
+    hdr->version = 1;
+    hdr->width = KINECT2_IR_WIDTH;
+    hdr->height = KINECT2_IR_HEIGHT;
+    hdr->payload_bytes = KINECT_IR_PAYLOAD_BYTES;
+
+    cout << "IR + depth shared memory active at " << KINECT_IR_SHM_NAME << " (" << this->irShmTotalSize << " bytes)" << endl;
+    return true;
+}
+
+void Kinect2Pipe::publishIrDepth(Frame* irFrame, Frame* depthFrame) {
+    if (!this->irShmPtr || !irFrame) return;
+    if (irFrame->width != KINECT2_IR_WIDTH || irFrame->height != KINECT2_IR_HEIGHT) return;
+
+    auto* hdr = reinterpret_cast<KinectIrSharedMemoryHeader*>(this->irShmPtr);
+    auto* irOut = reinterpret_cast<uint16_t*>(this->irShmPtr + sizeof(KinectIrSharedMemoryHeader));
+    uint16_t* depthOut = irOut + KINECT_IR_PIXELS;
+    const float* irIn = reinterpret_cast<const float*>(irFrame->data);
+    const bool hasDepth = depthFrame && depthFrame->width == KINECT2_IR_WIDTH && depthFrame->height == KINECT2_IR_HEIGHT;
+    const float* depthIn = hasDepth ? reinterpret_cast<const float*>(depthFrame->data) : nullptr;
+
+    __atomic_add_fetch(&hdr->sequence, 1, __ATOMIC_RELEASE);
+
+    for (int i = 0; i < KINECT_IR_PIXELS; ++i) {
+        float v = irIn[i];
+        irOut[i] = static_cast<uint16_t>(v <= 0.0f ? 0.0f : (v >= 65535.0f ? 65535.0f : v));
+    }
+    if (hasDepth) {
+        for (int i = 0; i < KINECT_IR_PIXELS; ++i) {
+            float d = depthIn[i];  // millimetres, 0 = invalid
+            depthOut[i] = static_cast<uint16_t>(d <= 0.0f ? 0.0f : (d >= 65535.0f ? 65535.0f : d));
+        }
+    } else {
+        memset(depthOut, 0, KINECT_IR_PIXELS * sizeof(uint16_t));
+    }
+
+    struct timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    hdr->timestamp_ns = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
+    hdr->device_ts = irFrame->timestamp;
+    hdr->device_seq = irFrame->sequence;
+    hdr->flags = hasDepth ? 1u : 0u;
+
+    __atomic_add_fetch(&hdr->sequence, 1, __ATOMIC_RELEASE);
+}
+
+void Kinect2Pipe::closeIrShm() {
+    if (this->irShmPtr) {
+        munmap(this->irShmPtr, this->irShmTotalSize);
+        this->irShmPtr = nullptr;
+        unlink(KINECT_IR_SHM_NAME);
+    }
+    if (this->irShmFd >= 0) {
+        close(this->irShmFd);
+        this->irShmFd = -1;
+    }
 }

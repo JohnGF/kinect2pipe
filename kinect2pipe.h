@@ -42,7 +42,31 @@ struct KinectSharedMemoryHeader {
     uint32_t mode;          // VideoMode (0=RGB, 1=BOOST, 2=IR)
     uint64_t sequence;      // Seqlock: odd while writing, even when stable
     uint64_t timestamp_ns;  // CLOCK_MONOTONIC in nanoseconds
-    uint8_t  reserved[24];  // 64 bytes total header
+    uint32_t device_ts;     // Kinect device timestamp of the source frame (0.125 ms ticks), 0 if none
+    uint32_t device_seq;    // Kinect device frame sequence number, 0 if none
+    uint8_t  reserved[16];  // 64 bytes total header
+};
+
+// Second shared-memory segment carrying raw IR + depth at native 512x424, written
+// in parallel with the color stream when kinect2pipe runs with --ir.
+#define KINECT_IR_SHM_NAME "/dev/shm/kinect2pipe_ir_shm"
+#define KINECT_IR_SHM_MAGIC 0x4B324952 // 'K2IR'
+#define KINECT_IR_PIXELS (KINECT2_IR_WIDTH * KINECT2_IR_HEIGHT)
+// Payload: uint16 IR[512*424] (raw amplitude, clamped to 0..65535), then uint16 depth_mm[512*424]
+#define KINECT_IR_PAYLOAD_BYTES (KINECT_IR_PIXELS * 2 * 2)
+
+struct KinectIrSharedMemoryHeader {
+    uint32_t magic;         // 0x4B324952
+    uint32_t version;       // 1
+    uint32_t width;         // 512
+    uint32_t height;        // 424
+    uint32_t payload_bytes; // 868352
+    uint32_t flags;         // bit0 = depth present
+    uint64_t sequence;      // Seqlock: odd while writing, even when stable
+    uint64_t timestamp_ns;  // CLOCK_MONOTONIC in nanoseconds
+    uint32_t device_ts;     // Kinect device timestamp (same clock as the color header's device_ts)
+    uint32_t device_seq;    // Kinect device frame sequence number
+    uint8_t  reserved[16];  // 64 bytes total header
 };
 #pragma pack(pop)
 
@@ -55,7 +79,7 @@ enum VideoMode {
 
 class Kinect2Pipe {
 public:
-    explicit Kinect2Pipe();
+    explicit Kinect2Pipe(bool irShmEnabled = false);
     ~Kinect2Pipe();
 
     void openLoopback(const char* loopbackDev, const char* loopbackDev2 = nullptr);
@@ -117,6 +141,7 @@ private:
     bool openKinect2Device();
     bool handleRgbFrame(Frame* frame, bool boost);
     bool handleIrFrame(Frame* frame);
+    void publishIrDepth(Frame* irFrame, Frame* depthFrame);
     void procMonitorV4L2LoopbackDevice(const char* loopbackDev);
     void keyboardListener();
     void drainInotifyEvents();
@@ -125,6 +150,15 @@ private:
     bool initShm();
     void closeShm();
     void updateShm(const uint8_t* buffer, size_t size);
+
+    bool irShmEnabled;
+    int irShmFd;
+    uint8_t* irShmPtr;
+    size_t irShmTotalSize;
+    uint32_t pendingDeviceTs;
+    uint32_t pendingDeviceSeq;
+    bool initIrShm();
+    void closeIrShm();
     void writeToOutputs(const uint8_t* buffer, size_t size);
 };
 

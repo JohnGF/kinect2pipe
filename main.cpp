@@ -1,5 +1,6 @@
 #include <csignal>
 #include <iostream>
+#include <cstring>
 #include "kinect2pipe.h"
 
 static Kinect2Pipe* g_pipe = nullptr;
@@ -35,8 +36,22 @@ void signalHandler(int signum) {
  * @return Exit status
  */
 int main(int argc, char** argv) {
-    if (argc < 2 || argc > 3) {
-        printf("usage: kinect2pipe <primary v4l2 device> [secondary v4l2 device]\n");
+    const char* devices[2] = {nullptr, nullptr};
+    int deviceCount = 0;
+    bool irShm = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--ir") == 0) {
+            irShm = true;
+        } else if (argv[i][0] == '-' || deviceCount >= 2) {
+            deviceCount = -1;
+            break;
+        } else {
+            devices[deviceCount++] = argv[i];
+        }
+    }
+    if (deviceCount < 1) {
+        printf("usage: kinect2pipe [--ir] <primary v4l2 device> [secondary v4l2 device]\n");
+        printf("  --ir   also stream raw IR + depth (512x424) to /dev/shm/kinect2pipe_ir_shm alongside color\n");
         exit(-1);
     }
 
@@ -49,9 +64,8 @@ int main(int argc, char** argv) {
     sigaction(SIGUSR1, &sa, nullptr);
     sigaction(SIGUSR2, &sa, nullptr);
 
-    g_pipe = new Kinect2Pipe();
-    const char* dev2 = (argc == 3) ? argv[2] : nullptr;
-    g_pipe->openLoopback(argv[1], dev2);
+    g_pipe = new Kinect2Pipe(irShm);
+    g_pipe->openLoopback(devices[0], devices[1]);
     g_pipe->run();
 
     delete g_pipe;
